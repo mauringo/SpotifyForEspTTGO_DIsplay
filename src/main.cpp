@@ -6,6 +6,9 @@
 #include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
 
 
@@ -26,6 +29,90 @@ String refreshToken;
 String lastArtist = "";
 String lastTrack = "";
 bool lastKnownPlaying = false;
+
+// Original TTGO T-Display: S1 = GPIO0, S2 = GPIO35 (board pull-up).
+const uint8_t BUTTON_S1 = 0;
+const uint8_t BUTTON_S2 = 35;
+QueueHandle_t buttonEvents = nullptr;
+
+// Sample independently of blocking Spotify requests. Queue only debounced
+// press edges, so holding a button sends one command until it is released.
+void sampleButtons(void*)
+{
+    const uint8_t pins[] = {BUTTON_S1, BUTTON_S2};
+    int previous[] = {HIGH, HIGH};
+    int stable[] = {HIGH, HIGH};
+    unsigned long changedAt[] = {0, 0};
+    for (;;)
+    {
+        for (uint8_t i = 0; i < 2; ++i)
+        {
+            int level = digitalRead(pins[i]);
+            unsigned long now = millis();
+            if (level != previous[i])
+            {
+                previous[i] = level;
+                changedAt[i] = now;
+            }
+            if (level != stable[i] && now - changedAt[i] >= 40)
+            {
+                stable[i] = level;
+                if (level == LOW)
+                    xQueueSend(buttonEvents, &i, 0);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void setupButtons()
+{
+    pinMode(BUTTON_S1, INPUT_PULLUP);
+    pinMode(BUTTON_S2, INPUT); // GPIO35 has no internal pull-up.
+    buttonEvents = xQueueCreate(4, sizeof(uint8_t));
+    if (buttonEvents == nullptr)
+    {
+        Serial.println("Unable to allocate button queue.");
+        return;
+    }
+    if (xTaskCreate(sampleButtons, "buttons", 2048, nullptr, 1, nullptr) != pdPASS)
+    {
+        vQueueDelete(buttonEvents);
+        buttonEvents = nullptr;
+        Serial.println("Unable to start button task.");
+    }
+}
+
+bool handleButton()
+{
+    uint8_t button;
+    if (buttonEvents == nullptr || xQueueReceive(buttonEvents, &button, 0) != pdTRUE)
+        return false;
+
+    // Keep all Spotify calls in the main task; the client is shared.
+    response result;
+    if (button == 0)
+    {
+        result = sp->is_playing() ? sp->pause_playback() : sp->start_a_users_playback();
+    }
+    else
+    {
+        result = sp->skip_to_next();
+    }
+    Serial.printf("S%u command: HTTP %d\n", button + 1, result.status_code);
+    return true;
+}
+
+void waitForPlaybackPoll()
+{
+    unsigned long started = millis();
+    while (millis() - started < 1000)
+    {
+        if (handleButton())
+            return; // Refresh the screen after a command.
+        delay(10);
+    }
+}
 
 void showStatus(const String& text)
 {
@@ -233,7 +320,7 @@ void setupSpotify()
         );
     }
 
-    sp->set_scopes("");
+    sp->set_scopes("user-read-playback-state user-read-currently-playing user-modify-playback-state");
     sp->set_log_level(SPOTIFY_LOG_DEBUG);
     sp->begin();
 
@@ -291,6 +378,7 @@ void setup()
     connect_to_wifi();
     syncTime();
     setupSpotify();
+    setupButtons();
 
     showStatus("Ready");
     delay(1000);
@@ -314,6 +402,8 @@ void loop()
         delay(1500);
         ESP.restart();
     }
+
+    handleButton();
 
     bool isPlaying = sp->is_playing();
     Serial.print("Spotify playback: ");
@@ -358,7 +448,7 @@ void loop()
         renderLastSongOnly(false);
 
         Serial.println("Spotify is paused or stopped.");
-        delay(1000);
+        waitForPlaybackPoll();
         return;
     }
 
@@ -378,5 +468,5 @@ void loop()
         showStatus("Playing");
     }
 
-    delay(1000);
+    waitForPlaybackPoll();
 }

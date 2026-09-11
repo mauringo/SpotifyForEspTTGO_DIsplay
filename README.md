@@ -17,7 +17,16 @@ This project is based on [mauringo/SpotifyEsp32_fixedAuthReboot](https://github.
 - Keeps the last valid track and artist visible when playback pauses, stops, or a metadata request returns invalid data. Before valid metadata is available, it shows a simple `Playing` or `Paused` message.
 - Automatically restarts after approximately 55 minutes of the main loop, then reconnects using the saved login. If the saved refresh token fails during startup, it clears the token and restarts to request a new browser login.
 
-The display uses fixed-size text; long titles or artist lists can wrap or be clipped. This example implements a status display, with no audio output or button-based playback controls.
+The display uses fixed-size text; long titles or artist lists can wrap or be clipped. This example implements a status display, with button-based playback controls and no audio output.
+
+## Button controls
+
+- **S1 (GPIO0):** toggles Spotify playback between pause and play.
+- **S2 (GPIO35):** skips to the next song.
+
+Each press sends one command; holding a button does not repeat it. Buttons become active after Spotify login. Commands wait for any Spotify request already in progress, and the display refreshes after a command. The GPIO mapping is for the [original TTGO T-Display](https://wiki.lilygo.cc/products/t-display-series/t-display/).
+
+Start playback on your phone, computer, or another Spotify device first. These controls require Spotify Premium and the `user-modify-playback-state` permission, as described in the [Spotify playback API documentation](https://developer.spotify.com/documentation/web-api/reference/skip-users-playback-to-next-track). If your saved login lacks that permission, repeat browser authorization using `FORCE_NEW_LOGIN` as described below. Command HTTP status codes are printed in the serial monitor for troubleshooting.
 
 ## Setup
 
