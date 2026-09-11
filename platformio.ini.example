@@ -1,0 +1,19 @@
+[env:esp32-s3-devkitc-1]
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.38-1/platform-espressif32.zip
+board = esp32-s3-devkitc-1
+framework = arduino
+monitor_speed = 115200
+
+board_build.psram_type = opi
+board_upload.flash_size = 4MB
+board_upload.maximum_size = 4194304
+board_build.partitions = default.csv
+board_build.filesystem = littlefs
+
+build_flags =
+    -DBOARD_HAS_PSRAM
+    -DARDUINO_USB_MODE=1
+    -DARDUINO_USB_CDC_ON_BOOT=1
+
+lib_deps =
+    https://github.com/FinianLandes/Spotify_Esp32.git
