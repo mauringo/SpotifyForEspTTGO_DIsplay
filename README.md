@@ -1,14 +1,44 @@
-# ESPttgoTdisplay
+# Spotify for ESP32 TTGO T-Display
 
-Spotify now-playing display for an ESP32 TTGO T-Display, built with Arduino and PlatformIO.
+This example turns an ESP32 TTGO T-Display into a small Spotify now-playing screen. It connects to Wi-Fi, authenticates with your Spotify account, and shows the current track, artist names, and playback status on the built-in 240 × 135 display in landscape orientation. Music plays on your Spotify playback device; the ESP32 displays its status.
 
-This project is based on [mauringo/SpotifyEsp32_fixedAuthReboot](https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot).
+This project is based on [mauringo/SpotifyEsp32_fixedAuthReboot](https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot) and uses that library with Arduino, PlatformIO, and TFT_eSPI.
+
+![TTGO T-Display showing the track Glue in green, artist names in cyan, and PLAYING in yellow](image.jpeg)
+
+*The example running on a TTGO T-Display: track title at the top, artist names below, and playback status along the bottom.*
+
+## What the example does
+
+- Connects to the configured Wi-Fi network and synchronizes the clock using NTP before Spotify authentication.
+- Starts browser authorization on first use and saves the Spotify refresh token in the ESP32’s nonvolatile storage, so it can reuse the login after a restart.
+- Polls playback status, artist names, and track title, with a one-second delay between polling cycles. Network requests add to the update interval.
+- Shows the track title in green, artist names in cyan, and `PLAYING` in yellow or `PAUSED` in red.
+- Keeps the last valid track and artist visible when playback pauses, stops, or a metadata request returns invalid data. Before valid metadata is available, it shows a simple `Playing` or `Paused` message.
+- Automatically restarts after approximately 55 minutes of the main loop, then reconnects using the saved login. If the saved refresh token fails during startup, it clears the token and restarts to request a new browser login.
+
+The display uses fixed-size text; long titles or artist lists can wrap or be clipped. This example implements a status display, with no audio output or button-based playback controls.
 
 ## Setup
 
-1. Copy `include/secrets.h.example` to `include/secrets.h` and enter your Wi-Fi and Spotify application credentials. The local credentials file is ignored by Git.
-2. Connect your TTGO T-Display.
-3. Build with `pio run`, upload with `pio run --target upload`, and open the serial monitor with `pio device monitor`.
-4. Follow the Spotify authorization instructions shown by the firmware.
+1. Open this project in PlatformIO and connect an ESP32 TTGO T-Display over USB.
+2. Copy `include/secrets.h.example` to `include/secrets.h` and enter your Wi-Fi SSID/password and Spotify application client ID/secret. The local credentials file is ignored by Git.
+3. Follow the [base library’s authentication setup](https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot) for your Spotify application.
+4. Build and upload the firmware:
 
-The active firmware is in `src/main.cpp`; display pins and library dependencies are configured in `platformio.ini`.
+   ```sh
+   pio run
+   pio run --target upload
+   ```
+
+5. Open the serial monitor at 115200 baud:
+
+   ```sh
+   pio device monitor
+   ```
+
+6. On first use, follow the authentication URL/instructions in the serial output and complete Spotify authorization in your browser. Start Spotify playback on your playback device to see the track information on the display.
+
+To force a new login, set `FORCE_NEW_LOGIN` to `true` in `src/main.cpp` and upload once. Set it back to `false` and upload again after authorizing so subsequent restarts retain the saved login. The automatic restart interval is controlled by `REBOOT_INTERVAL_MS`.
+
+The active firmware is in `src/main.cpp`; display pins, board settings, and library dependencies are configured in `platformio.ini`.
