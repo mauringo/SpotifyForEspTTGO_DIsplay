@@ -9,6 +9,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include "ApiSchedule.h"
+#include "ButtonClicks.h"
 
 
 
@@ -28,23 +30,56 @@ TFT_eSPI tft = TFT_eSPI();
 String refreshToken;
 String lastArtist = "";
 String lastTrack = "";
+String currentTrackUri;
 bool lastKnownPlaying = false;
+bool playbackKnown = false;
+ApiSchedule apiSchedule;
+QueueHandle_t buttonEvents = nullptr;
+
+void showStatus(const String& text);
+void renderLastSongOnly(bool isPlaying);
+bool refreshPlayback();
+
+bool acceptResponse(const response& result)
+{
+    if (result.status_code == 429)
+    {
+        apiSchedule.rateLimited(millis());
+        if (buttonEvents != nullptr)
+            xQueueReset(buttonEvents);
+        Serial.printf("Spotify rate limited: waiting %lu seconds.\n",
+                      static_cast<unsigned long>(apiSchedule.cooldownMs() / 1000));
+        showStatus("Rate limited\nWaiting...");
+        return false;
+    }
+    if (result.status_code < 200 || result.status_code >= 300)
+    {
+        apiSchedule.failed(millis());
+        Serial.printf("Spotify request failed: HTTP %d\n", result.status_code);
+        return false;
+    }
+    apiSchedule.succeeded();
+    return true;
+}
 
 // Original TTGO T-Display: S1 = GPIO0, S2 = GPIO35 (board pull-up).
 const uint8_t BUTTON_S1 = 0;
 const uint8_t BUTTON_S2 = 35;
-QueueHandle_t buttonEvents = nullptr;
 
 // Sample independently of blocking Spotify requests. Queue only debounced
-// press edges, so holding a button sends one command until it is released.
+// clicks, so double-click recognition continues while network requests block.
 void sampleButtons(void*)
 {
     const uint8_t pins[] = {BUTTON_S1, BUTTON_S2};
     int previous[] = {HIGH, HIGH};
     int stable[] = {HIGH, HIGH};
     unsigned long changedAt[] = {0, 0};
+    ButtonClicks clicks;
     for (;;)
     {
+        ButtonAction action = clicks.tick(millis());
+        if (action != ButtonAction::None)
+            xQueueSend(buttonEvents, &action, 0);
         for (uint8_t i = 0; i < 2; ++i)
         {
             int level = digitalRead(pins[i]);
@@ -58,7 +93,11 @@ void sampleButtons(void*)
             {
                 stable[i] = level;
                 if (level == LOW)
-                    xQueueSend(buttonEvents, &i, 0);
+                {
+                    action = i == 0 ? clicks.press(now) : ButtonAction::NextTrack;
+                    if (action != ButtonAction::None)
+                        xQueueSend(buttonEvents, &action, 0);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -69,7 +108,7 @@ void setupButtons()
 {
     pinMode(BUTTON_S1, INPUT_PULLUP);
     pinMode(BUTTON_S2, INPUT); // GPIO35 has no internal pull-up.
-    buttonEvents = xQueueCreate(4, sizeof(uint8_t));
+    buttonEvents = xQueueCreate(4, sizeof(ButtonAction));
     if (buttonEvents == nullptr)
     {
         Serial.println("Unable to allocate button queue.");
@@ -85,33 +124,60 @@ void setupButtons()
 
 bool handleButton()
 {
-    uint8_t button;
+    ButtonAction button;
     if (buttonEvents == nullptr || xQueueReceive(buttonEvents, &button, 0) != pdTRUE)
         return false;
+    if (apiSchedule.blocked(millis()))
+        return false; // Discard presses during cooldown instead of replaying them later.
 
-    // Keep all Spotify calls in the main task; the client is shared.
-    response result;
-    if (button == 0)
+    if (button == ButtonAction::SaveTrack)
     {
-        result = sp->is_playing() ? sp->pause_playback() : sp->start_a_users_playback();
+        // Fetch current identity so a track change cannot save stale display data.
+        if (!refreshPlayback())
+            return false;
+        if (!currentTrackUri.startsWith("spotify:track:"))
+        {
+            showStatus("No track to save");
+            return false;
+        }
+        const char* uris[] = {currentTrackUri.c_str()};
+        response result = sp->save_items_to_library(1, uris);
+        Serial.printf("Save favourite: HTTP %d\n", result.status_code);
+        if (!acceptResponse(result))
+        {
+            if (result.status_code == 403)
+                showStatus("Save denied\nCheck login");
+            else if (result.status_code != 429)
+                showStatus("Save failed");
+            return false;
+        }
+        showStatus("Saved to\nfavourites");
+        apiSchedule.afterCommand(millis());
+        return true;
     }
-    else
+
+    // One shared response supplies both metadata and playback state.
+    // Refresh stale state before toggling; never assume an error means playing.
+    if (button == ButtonAction::TogglePlayback && (!playbackKnown || apiSchedule.pollDue(millis())))
     {
-        result = sp->skip_to_next();
+        if (!refreshPlayback())
+            return false;
     }
-    Serial.printf("S%u command: HTTP %d\n", button + 1, result.status_code);
+
+    response result = button == ButtonAction::TogglePlayback
+        ? (lastKnownPlaying ? sp->pause_playback() : sp->start_a_users_playback())
+        : sp->skip_to_next();
+    Serial.printf("S%u command: HTTP %d\n", button == ButtonAction::TogglePlayback ? 1u : 2u, result.status_code);
+    if (!acceptResponse(result))
+        return false;
+    if (button == ButtonAction::TogglePlayback)
+    {
+        lastKnownPlaying = !lastKnownPlaying;
+        playbackKnown = true;
+        renderLastSongOnly(lastKnownPlaying);
+    }
+    apiSchedule.afterCommand(millis());
     return true;
-}
-
-void waitForPlaybackPoll()
-{
-    unsigned long started = millis();
-    while (millis() - started < 1000)
-    {
-        if (handleButton())
-            return; // Refresh the screen after a command.
-        delay(10);
-    }
 }
 
 void showStatus(const String& text)
@@ -320,7 +386,7 @@ void setupSpotify()
         );
     }
 
-    sp->set_scopes("user-read-playback-state user-read-currently-playing user-modify-playback-state");
+    sp->set_scopes("user-read-playback-state user-read-currently-playing user-modify-playback-state user-library-modify");
     sp->set_log_level(SPOTIFY_LOG_DEBUG);
     sp->begin();
 
@@ -363,10 +429,6 @@ void setupSpotify()
     showStatus("Spotify OK");
     delay(1000);
 
-    if (!sp->is_playing())
-    {
-        showStatus("Paused");
-    }
 }
 
 void setup()
@@ -384,89 +446,77 @@ void setup()
     delay(1000);
 }
 
+bool refreshPlayback()
+{
+    JsonDocument filter;
+    filter["is_playing"] = true;
+    filter["item"]["name"] = true;
+    filter["item"]["uri"] = true;
+    filter["item"]["is_local"] = true;
+    filter["item"]["artists"][0]["name"] = true;
+    response result = sp->get_currently_playing_track(filter);
+    apiSchedule.afterPoll(millis());
+    if (!acceptResponse(result))
+        return false;
+
+    currentTrackUri = "";
+    if (result.status_code == 204)
+    {
+        playbackKnown = true;
+        lastKnownPlaying = false;
+        renderLastSongOnly(false);
+        return true;
+    }
+    if (!result.reply["is_playing"].is<bool>())
+    {
+        apiSchedule.failed(millis());
+        Serial.println("Spotify returned invalid playback data; keeping last display.");
+        return false;
+    }
+
+    if (!(result.reply["item"]["is_local"] | false))
+        currentTrackUri = result.reply["item"]["uri"] | "";
+    lastKnownPlaying = result.reply["is_playing"].as<bool>();
+    playbackKnown = true;
+    String track = result.reply["item"]["name"] | "";
+    String artist;
+    for (JsonObject entry : result.reply["item"]["artists"].as<JsonArray>())
+    {
+        const char* name = entry["name"] | "";
+        if (*name == '\0')
+            continue;
+        if (!artist.isEmpty())
+            artist += ", ";
+        artist += name;
+    }
+    if (!track.isEmpty() && !artist.isEmpty())
+    {
+        lastTrack = track;
+        lastArtist = artist;
+    }
+    renderLastSongOnly(lastKnownPlaying);
+    return true;
+}
+
 void loop()
 {
     static unsigned long lastRebootCheck = millis();
-
     if (sp == nullptr)
     {
         delay(1000);
         return;
     }
 
-    if (millis() - lastRebootCheck >= REBOOT_INTERVAL_MS)
+    // A scheduled restart must not bypass a rate-limit cooldown.
+    if (millis() - lastRebootCheck >= REBOOT_INTERVAL_MS && !apiSchedule.blocked(millis()))
     {
-        Serial.println();
-        Serial.println("Reboot timer reached: restarting ESP32.");
         showStatus("Restarting...");
         delay(1500);
         ESP.restart();
     }
 
     handleButton();
-
-    bool isPlaying = sp->is_playing();
-    Serial.print("Spotify playback: ");
-    Serial.println(isPlaying ? "PLAYING" : "NOT PLAYING");
-
-    String artist = sp->current_artist_names();
-    String track = sp->current_track_name();
-
-    bool artistValid =
-        artist.length() > 0 &&
-        artist != "Something went wrong" &&
-        artist != "null";
-
-    bool trackValid =
-        track.length() > 0 &&
-        track != "Something went wrong" &&
-        track != "null";
-
-    if (artistValid && trackValid)
-    {
-        if (
-            artist != lastArtist ||
-            track != lastTrack
-        )
-        {
-            lastArtist = artist;
-            lastTrack = track;
-
-            Serial.println();
-            Serial.println("==============================");
-            Serial.print("Artist: ");
-            Serial.println(artist);
-            Serial.print("Track: ");
-            Serial.println(track);
-            Serial.println("==============================");
-        }
-    }
-
-    if (!isPlaying)
-    {
-        lastKnownPlaying = false;
-        renderLastSongOnly(false);
-
-        Serial.println("Spotify is paused or stopped.");
-        waitForPlaybackPoll();
-        return;
-    }
-
-    if (lastArtist.length() > 0 && lastTrack.length() > 0)
-    {
-        lastKnownPlaying = true;
-        renderLastSongOnly(true);
-    }
-    else if (artistValid && trackValid)
-    {
-        lastArtist = artist;
-        lastTrack = track;
-        renderLastSongOnly(true);
-    }
-    else
-    {
-        showStatus("Playing");
-    }
-
-    waitForPlaybackPoll();
+    if (apiSchedule.pollDue(millis()))
+        refreshPlayback();
+    delay(10);
 }
